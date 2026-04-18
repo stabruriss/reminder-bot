@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 import os
 import requests
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import DateTime
 
 app = Flask(__name__)
 
@@ -28,6 +29,15 @@ def to_utc(local_iso_string):
     dt = datetime.fromisoformat(local_iso_string)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=local_tz())
+    return dt.astimezone(timezone.utc)
+
+
+def as_utc_aware(dt):
+    """Normalize a possibly-naive datetime from the DB to a tz-aware UTC datetime."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
@@ -61,16 +71,44 @@ def send_telegram_message(chat_id, text):
 
 class Reminder(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    time_utc = db.Column(db.DateTime, nullable=False)
+    time_utc = db.Column(DateTime(timezone=True), nullable=False)
     message = db.Column(db.String(500), nullable=False)
     chat_id = db.Column(db.String(50), nullable=False)
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = db.Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     sent = db.Column(db.Boolean, default=False)
-    sent_at = db.Column(db.DateTime, nullable=True)
+    sent_at = db.Column(DateTime(timezone=True), nullable=True)
+
+
+def _migrate_to_timestamptz():
+    """Idempotent migration: convert naive timestamp columns to timestamptz.
+
+    Existing rows are assumed to already hold UTC values (that is what the
+    previous code attempted to write). On Postgres this is safe to re-run.
+    SQLite keeps datetimes as strings so the conversion is a no-op.
+    """
+    bind = db.session.get_bind()
+    if bind.dialect.name != 'postgresql':
+        return
+    from sqlalchemy import text
+    stmts = [
+        "ALTER TABLE reminder ALTER COLUMN time_utc TYPE timestamp with time zone "
+        "USING time_utc AT TIME ZONE 'UTC'",
+        "ALTER TABLE reminder ALTER COLUMN created_at TYPE timestamp with time zone "
+        "USING created_at AT TIME ZONE 'UTC'",
+        "ALTER TABLE reminder ALTER COLUMN sent_at TYPE timestamp with time zone "
+        "USING sent_at AT TIME ZONE 'UTC'",
+    ]
+    with bind.begin() as conn:
+        for stmt in stmts:
+            try:
+                conn.execute(text(stmt))
+            except Exception as e:
+                print(f"Migration skipped ({e.__class__.__name__}): {stmt[:60]}...")
 
 
 with app.app_context():
     db.create_all()
+    _migrate_to_timestamptz()
 
 
 @app.route('/')
@@ -145,7 +183,8 @@ def list_reminders():
     tz = local_tz()
     return jsonify([{
         "id": r.id,
-        "time_local": r.time_utc.replace(tzinfo=timezone.utc).astimezone(tz).isoformat(),
+        "time_local": as_utc_aware(r.time_utc).astimezone(tz).isoformat(),
+        "time_utc": as_utc_aware(r.time_utc).isoformat(),
         "message": r.message,
         "sent": r.sent,
     } for r in reminders])
