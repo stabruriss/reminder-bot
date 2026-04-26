@@ -104,12 +104,16 @@ def _migrate_schema():
         "ALTER TABLE reminder ADD COLUMN cron VARCHAR(100)",
         "ALTER TABLE reminder ADD COLUMN tz VARCHAR(64)",
     ]
-    with bind.begin() as conn:
-        for stmt in stmts:
-            try:
+    # Each ALTER must run in its own transaction. Postgres aborts the entire
+    # transaction on the first error, so a single "column already exists" turns
+    # every subsequent statement into InternalError ("current transaction is
+    # aborted") and the migration silently does nothing.
+    for stmt in stmts:
+        try:
+            with bind.begin() as conn:
                 conn.execute(text(stmt))
-            except Exception as e:
-                print(f"Migration skipped ({e.__class__.__name__}): {stmt[:60]}...")
+        except Exception as e:
+            print(f"Migration skipped ({e.__class__.__name__}): {stmt[:60]}...")
 
 
 with app.app_context():
